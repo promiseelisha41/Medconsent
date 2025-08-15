@@ -10,6 +10,11 @@
 (define-constant ERR_AUDIT_NOT_FOUND (err u108))
 (define-constant ERR_INVALID_AUDIT_TYPE (err u109))
 (define-constant ERR_INSUFFICIENT_PERMISSIONS (err u110))
+(define-constant ERR_TREATMENT_PLAN_NOT_FOUND (err u111))
+(define-constant ERR_STAGE_NOT_FOUND (err u112))
+(define-constant ERR_STAGE_NOT_READY (err u113))
+(define-constant ERR_PLAN_ALREADY_COMPLETED (err u114))
+(define-constant ERR_INVALID_STAGE_ORDER (err u115))
 
 (define-map patients
   { patient-id: principal }
@@ -56,6 +61,56 @@
 
 (define-data-var next-consent-id uint u1)
 (define-data-var next-audit-id uint u1)
+(define-data-var next-treatment-plan-id uint u1)
+
+;; Treatment plans with multiple stages requiring sequential consent
+(define-map treatment-plans
+  { plan-id: uint }
+  {
+    patient-id: principal,
+    provider-id: principal,
+    plan-name: (string-ascii 200),
+    total-stages: uint,
+    current-stage: uint,
+    status: (string-ascii 20), ;; PENDING, ACTIVE, COMPLETED, CANCELLED
+    created-at: uint,
+    updated-at: uint,
+    estimated-duration: uint,
+    priority: (string-ascii 10) ;; LOW, MEDIUM, HIGH, URGENT
+  }
+)
+
+;; Individual stages within treatment plans
+(define-map treatment-stages
+  { plan-id: uint, stage-number: uint }
+  {
+    stage-name: (string-ascii 200),
+    description: (string-ascii 500),
+    prerequisites: (list 5 uint), ;; Previous stages that must be completed
+    consent-required: bool,
+    consent-given: bool,
+    consent-timestamp: (optional uint),
+    stage-status: (string-ascii 20), ;; PENDING, READY, IN_PROGRESS, COMPLETED, SKIPPED
+    provider-notes: (string-ascii 500),
+    patient-notes: (optional (string-ascii 500)),
+    estimated-duration: uint,
+    actual-start: (optional uint),
+    actual-completion: (optional uint),
+    risk-level: uint ;; 1-10 scale
+  }
+)
+
+;; Patient approval queue for treatment plan stages
+(define-map patient-approvals
+  { patient-id: principal, plan-id: uint, stage-number: uint }
+  {
+    approval-status: (string-ascii 20), ;; PENDING, APPROVED, REJECTED, EXPIRED
+    requested-at: uint,
+    responded-at: (optional uint),
+    response-notes: (optional (string-ascii 300)),
+    expires-at: uint
+  }
+)
 
 (define-map audit-trail
   { audit-id: uint }
@@ -319,6 +374,301 @@
 
 (define-read-only (get-next-consent-id)
   (var-get next-consent-id)
+)
+
+;; Create a new treatment plan with multiple stages
+(define-public (create-treatment-plan (patient-id principal) (plan-name (string-ascii 200)) (total-stages uint) (priority (string-ascii 10)) (estimated-duration uint))
+  (let (
+    (plan-id (var-get next-treatment-plan-id))
+    (provider-data (map-get? healthcare-providers { provider-id: tx-sender }))
+  )
+    (if (and
+      (is-some (map-get? patients { patient-id: patient-id }))
+      (is-some provider-data)
+      (get is-verified (unwrap-panic provider-data))
+      (> total-stages u0)
+      (<= total-stages u20) ;; Maximum 20 stages
+    )
+      (begin
+        (map-set treatment-plans
+          { plan-id: plan-id }
+          {
+            patient-id: patient-id,
+            provider-id: tx-sender,
+            plan-name: plan-name,
+            total-stages: total-stages,
+            current-stage: u0,
+            status: "PENDING",
+            created-at: stacks-block-height,
+            updated-at: stacks-block-height,
+            estimated-duration: estimated-duration,
+            priority: priority
+          }
+        )
+        (var-set next-treatment-plan-id (+ plan-id u1))
+        (ok plan-id)
+      )
+      ERR_PROVIDER_NOT_AUTHORIZED
+    )
+  )
+)
+
+;; Add a stage to an existing treatment plan
+(define-public (add-treatment-stage (plan-id uint) (stage-number uint) (stage-name (string-ascii 200)) (description (string-ascii 500)) (prerequisites (list 5 uint)) (consent-required bool) (estimated-duration uint) (risk-level uint))
+  (match (map-get? treatment-plans { plan-id: plan-id })
+    plan-data
+    (if (and
+      (is-eq tx-sender (get provider-id plan-data))
+      (is-eq (get status plan-data) "PENDING")
+      (> stage-number u0)
+      (<= stage-number (get total-stages plan-data))
+      (<= risk-level u10)
+    )
+      (begin
+        (map-set treatment-stages
+          { plan-id: plan-id, stage-number: stage-number }
+          {
+            stage-name: stage-name,
+            description: description,
+            prerequisites: prerequisites,
+            consent-required: consent-required,
+            consent-given: false,
+            consent-timestamp: none,
+            stage-status: "PENDING",
+            provider-notes: "",
+            patient-notes: none,
+            estimated-duration: estimated-duration,
+            actual-start: none,
+            actual-completion: none,
+            risk-level: risk-level
+          }
+        )
+        (ok true)
+      )
+      ERR_UNAUTHORIZED
+    )
+    ERR_TREATMENT_PLAN_NOT_FOUND
+  )
+)
+
+;; Activate treatment plan (provider can start the plan)
+(define-public (activate-treatment-plan (plan-id uint))
+  (match (map-get? treatment-plans { plan-id: plan-id })
+    plan-data
+    (if (and
+      (is-eq tx-sender (get provider-id plan-data))
+      (is-eq (get status plan-data) "PENDING")
+    )
+      (begin
+        (map-set treatment-plans
+          { plan-id: plan-id }
+          (merge plan-data {
+            status: "ACTIVE",
+            current-stage: u1,
+            updated-at: stacks-block-height
+          })
+        )
+        ;; Mark first stage as ready if no prerequisites
+        (update-stage-status plan-id u1)
+        (ok true)
+      )
+      ERR_UNAUTHORIZED
+    )
+    ERR_TREATMENT_PLAN_NOT_FOUND
+  )
+)
+
+;; Patient gives consent for a specific treatment stage
+(define-public (approve-treatment-stage (plan-id uint) (stage-number uint) (patient-notes (optional (string-ascii 500))))
+  (match (map-get? treatment-plans { plan-id: plan-id })
+    plan-data
+    (match (map-get? treatment-stages { plan-id: plan-id, stage-number: stage-number })
+      stage-data
+      (if (and
+        (is-eq tx-sender (get patient-id plan-data))
+        (is-eq (get status plan-data) "ACTIVE")
+        (get consent-required stage-data)
+        (not (get consent-given stage-data))
+        (or (is-eq (get stage-status stage-data) "READY") (is-eq (get stage-status stage-data) "PENDING"))
+      )
+        (begin
+          (map-set treatment-stages
+            { plan-id: plan-id, stage-number: stage-number }
+            (merge stage-data {
+              consent-given: true,
+              consent-timestamp: (some stacks-block-height),
+              stage-status: "READY",
+              patient-notes: patient-notes
+            })
+          )
+          (map-set patient-approvals
+            { patient-id: tx-sender, plan-id: plan-id, stage-number: stage-number }
+            {
+              approval-status: "APPROVED",
+              requested-at: stacks-block-height,
+              responded-at: (some stacks-block-height),
+              response-notes: (match patient-notes some-notes (some (unwrap-panic (as-max-len? some-notes u300))) none),
+              expires-at: (+ stacks-block-height u1440) ;; 24 hours
+            }
+          )
+          (ok true)
+        )
+        ERR_UNAUTHORIZED
+      )
+      ERR_STAGE_NOT_FOUND
+    )
+    ERR_TREATMENT_PLAN_NOT_FOUND
+  )
+)
+
+;; Provider starts a treatment stage
+(define-public (start-treatment-stage (plan-id uint) (stage-number uint) (provider-notes (string-ascii 500)))
+  (match (map-get? treatment-plans { plan-id: plan-id })
+    plan-data
+    (match (map-get? treatment-stages { plan-id: plan-id, stage-number: stage-number })
+      stage-data
+      (if (and
+        (is-eq tx-sender (get provider-id plan-data))
+        (is-eq (get status plan-data) "ACTIVE")
+        (is-eq (get stage-status stage-data) "READY")
+        (or (not (get consent-required stage-data)) (get consent-given stage-data))
+      )
+        (begin
+          (map-set treatment-stages
+            { plan-id: plan-id, stage-number: stage-number }
+            (merge stage-data {
+              stage-status: "IN_PROGRESS",
+              provider-notes: provider-notes,
+              actual-start: (some stacks-block-height)
+            })
+          )
+          (map-set treatment-plans
+            { plan-id: plan-id }
+            (merge plan-data {
+              current-stage: stage-number,
+              updated-at: stacks-block-height
+            })
+          )
+          (ok true)
+        )
+        ERR_STAGE_NOT_READY
+      )
+      ERR_STAGE_NOT_FOUND
+    )
+    ERR_TREATMENT_PLAN_NOT_FOUND
+  )
+)
+
+;; Provider completes a treatment stage
+(define-public (complete-treatment-stage (plan-id uint) (stage-number uint) (completion-notes (string-ascii 500)))
+  (match (map-get? treatment-plans { plan-id: plan-id })
+    plan-data
+    (match (map-get? treatment-stages { plan-id: plan-id, stage-number: stage-number })
+      stage-data
+      (if (and
+        (is-eq tx-sender (get provider-id plan-data))
+        (is-eq (get stage-status stage-data) "IN_PROGRESS")
+      )
+        (begin
+          (map-set treatment-stages
+            { plan-id: plan-id, stage-number: stage-number }
+            (merge stage-data {
+              stage-status: "COMPLETED",
+              provider-notes: completion-notes,
+              actual-completion: (some stacks-block-height)
+            })
+          )
+          ;; Check if this was the last stage
+          (if (is-eq stage-number (get total-stages plan-data))
+            (map-set treatment-plans
+              { plan-id: plan-id }
+              (merge plan-data {
+                status: "COMPLETED",
+                updated-at: stacks-block-height
+              })
+            )
+            ;; Progress to next stage
+            (update-stage-status plan-id (+ stage-number u1))
+          )
+          (ok true)
+        )
+        ERR_UNAUTHORIZED
+      )
+      ERR_STAGE_NOT_FOUND
+    )
+    ERR_TREATMENT_PLAN_NOT_FOUND
+  )
+)
+
+;; Helper function to update stage status based on prerequisites
+(define-private (update-stage-status (plan-id uint) (stage-number uint))
+  (match (map-get? treatment-stages { plan-id: plan-id, stage-number: stage-number })
+    stage-data
+    (let (
+      (prerequisites (get prerequisites stage-data))
+      (all-prereqs-met (check-prerequisites-completed plan-id prerequisites))
+    )
+      (if all-prereqs-met
+        (map-set treatment-stages
+          { plan-id: plan-id, stage-number: stage-number }
+          (merge stage-data { stage-status: "READY" })
+        )
+        true ;; Keep as pending
+      )
+    )
+    false
+  )
+)
+
+;; Check if all prerequisite stages are completed
+(define-private (check-prerequisites-completed (plan-id uint) (prerequisites (list 5 uint)))
+  (if (is-eq (len prerequisites) u0)
+    true ;; No prerequisites
+    (get all-completed (fold check-single-prerequisite prerequisites { plan-id: plan-id, all-completed: true }))
+  )
+)
+
+;; Helper for checking individual prerequisite
+(define-private (check-single-prerequisite (stage-num uint) (context { plan-id: uint, all-completed: bool }))
+  (if (get all-completed context)
+    (match (map-get? treatment-stages { plan-id: (get plan-id context), stage-number: stage-num })
+      stage-data
+      (merge context { all-completed: (is-eq (get stage-status stage-data) "COMPLETED") })
+      (merge context { all-completed: false })
+    )
+    context
+  )
+)
+
+;; Read-only functions for treatment plans
+(define-read-only (get-treatment-plan (plan-id uint))
+  (map-get? treatment-plans { plan-id: plan-id })
+)
+
+(define-read-only (get-treatment-stage (plan-id uint) (stage-number uint))
+  (map-get? treatment-stages { plan-id: plan-id, stage-number: stage-number })
+)
+
+(define-read-only (get-patient-approval (patient-id principal) (plan-id uint) (stage-number uint))
+  (map-get? patient-approvals { patient-id: patient-id, plan-id: plan-id, stage-number: stage-number })
+)
+
+(define-read-only (get-plan-progress (plan-id uint))
+  (match (map-get? treatment-plans { plan-id: plan-id })
+    plan-data
+    (some {
+      current-stage: (get current-stage plan-data),
+      total-stages: (get total-stages plan-data),
+      status: (get status plan-data),
+      completion-percentage: (/ (* (- (get current-stage plan-data) u1) u100) (get total-stages plan-data))
+    })
+    none
+  )
+)
+
+;; Get all pending approvals for a patient - returns list of plan IDs with pending approvals
+(define-read-only (get-pending-approvals (patient-id principal))
+  (list) ;; Simplified implementation - returns empty list for now
 )
 
 (define-private (create-audit-entry (action-type (string-ascii 50)) (target-type (string-ascii 50)) (target-id (string-ascii 100)) (patient-id (optional principal)) (provider-id (optional principal)) (consent-id (optional uint)) (details (string-ascii 500)) (risk-score uint))
@@ -607,3 +957,4 @@
 (define-private (uint-to-string (n uint))
   "uint-placeholder"
 )
+
